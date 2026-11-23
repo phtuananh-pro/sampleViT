@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
+import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset
 
@@ -33,7 +34,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
 
 def image_to_tensor(path: str | Path, image_size: int) -> torch.Tensor:
-    """Load one image, resize it, and return a float tensor in ``[0, 1]``.
+    """Load one image, resize only when needed, and return a float tensor.
 
     The returned tensor has shape ``(3, image_size, image_size)``:
 
@@ -45,6 +46,10 @@ def image_to_tensor(path: str | Path, image_size: int) -> torch.Tensor:
     That keeps the first preprocessing step easy to see. A larger project may
     add normalization and data augmentation, but those choices are separate
     from the basic ViT architecture.
+
+    Chapter VI.4 §§11, 13, and 15 treat input resolution as an evidence-cost
+    choice. Resizing happens before patchification: it can remove fine detail,
+    while the ViT later divides the resulting fixed-size grid into patches.
     """
 
     # Pillow renamed the resampling namespace in newer versions. This small
@@ -56,16 +61,17 @@ def image_to_tensor(path: str | Path, image_size: int) -> torch.Tensor:
     # grayscale or has an alpha channel. The model's first layer expects the
     # fixed number ``channels=3``.
     with Image.open(path) as image:
-        image = image.convert("RGB").resize((image_size, image_size), resampling.BILINEAR)
+        image = image.convert("RGB")
+        # A prepared cache already has the requested dimensions. Skip the
+        # expensive interpolation step when loading those cached images.
+        if image.size != (image_size, image_size):
+            image = image.resize((image_size, image_size), resampling.BILINEAR)
 
-        # ``getdata`` returns one RGB triple for every pixel. We materialize
-        # those values before closing the file so the tensor owns its data.
-        values = list(image.getdata())
+        # Pillow uses H x W x C; PyTorch models expect C x H x W. Copying
+        # creates writable tensor storage independent of the Pillow buffer.
+        pixels = np.asarray(image, dtype=np.uint8).copy()
 
-    # At this point values represents (H*W, 3). Reshape it back into the image
-    # grid, then move channels to the first dimension for PyTorch.
-    tensor = torch.tensor(values, dtype=torch.float32)
-    tensor = tensor.view(image_size, image_size, 3).permute(2, 0, 1)
+    tensor = torch.from_numpy(pixels).to(torch.float32).permute(2, 0, 1)
 
     # This is a simple scale, not a learned operation. It makes the numeric
     # range manageable before patch projection.
@@ -78,6 +84,10 @@ class ImageFolderDataset(Dataset[tuple[torch.Tensor, int]]):
     ``Dataset`` supplies one example at a time. ``DataLoader`` in train.py
     later groups these examples into batches. The dataset stores paths and
     integer labels rather than loading every image into memory at startup.
+
+    This class is data plumbing for the VI.4 companion example (§17), not a
+    ViT layer. Its output tensor is the image grid that PatchEmbedding turns
+    into visual states (§§2-4).
     """
 
     def __init__(
@@ -86,6 +96,7 @@ class ImageFolderDataset(Dataset[tuple[torch.Tensor, int]]):
         image_size: int,
         classes: list[str] | None = None,
     ) -> None:
+        """Index class folders and keep a stable class-to-label mapping."""
         super().__init__()
         self.root = Path(root)
         if not self.root.is_dir():
@@ -126,7 +137,7 @@ class ImageFolderDataset(Dataset[tuple[torch.Tensor, int]]):
 
     @staticmethod
     def _is_readable_image(path: Path) -> bool:
-        """Return whether Pillow can inspect the image without an error."""
+        """Skip corrupt files before they fail during later visual preprocessing."""
 
         try:
             with Image.open(path) as image:
@@ -140,12 +151,12 @@ class ImageFolderDataset(Dataset[tuple[torch.Tensor, int]]):
             return False
 
     def __len__(self) -> int:
-        """Return the number of usable image/label pairs."""
+        """Return the number of indexed image examples."""
 
         return len(self.samples)
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, int]:
-        """Load and return one ``(image_tensor, integer_label)`` pair."""
+        """Load one fixed-size image grid and its class label for the ViT."""
 
         path, label = self.samples[index]
         return image_to_tensor(path, self.image_size), label

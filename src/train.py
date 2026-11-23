@@ -1,19 +1,10 @@
-"""Train the small Vision Transformer.
+"""Train the small ViT using a prepared or ordinary image-folder dataset.
 
-This file connects the model to the supervised learning task:
-
-    image files -> tensors and labels -> ViT logits -> loss -> gradients
-    -> parameter updates -> better future predictions
-
-The training loop is intentionally ordinary. That makes it easier to see
-which parts belong to the ViT architecture and which parts belong to the
-training objective. The model only defines how an image becomes logits; this
-file defines how those logits are compared with labels and learned from.
-
-Example from the repository root:
-
-    python -m src.train --data data/cats_dogs --epochs 5
-    python .\\src\\train.py --data .\\data\\cats_dogs --epochs 5
+Chapter VI.4 §14 separates architecture from learned representation, objective,
+and recipe. This script supplies one supervised classification objective and a
+small training recipe for the model in ``vit.py``; it is not part of the ViT
+architecture itself. The printed split metrics help investigate §15 failure
+modes without treating a score as proof of how the model reasoned.
 """
 
 from __future__ import annotations
@@ -27,205 +18,169 @@ from torch import nn
 from torch.utils.data import DataLoader, random_split
 
 try:
-    # Module form: python -m src.train
     from .dataset import ImageFolderDataset
+    from .logging_utils import log, log_model_info
+    from .metrics import MetricAccumulator
     from .vit import VisionTransformer
 except ImportError:
-    # File form: python .\src\train.py
-    # When a file is executed directly, Python does not consider it part of
-    # the src package, so the package-relative imports above are unavailable.
     from dataset import ImageFolderDataset
+    from logging_utils import log, log_model_info
+    from metrics import MetricAccumulator
     from vit import VisionTransformer
 
 
 def parse_args() -> argparse.Namespace:
-    """Define the small set of settings exposed on the command line."""
+    """Define the VI.4 companion's input-grid, patch, model, and recipe choices.
 
-    parser = argparse.ArgumentParser(description="Train a small Vision Transformer.")
-
-    # Dataset and checkpoint paths are relative to the directory where the
-    # command is run, normally the repository root.
-    parser.add_argument("--data", type=Path, default=Path("data/cats_dogs"))
+    ``image-size`` and ``patch-size`` determine the patch count from §3 and
+    attention cost from §§9-11; optimizer and epoch settings belong to §14's
+    training recipe rather than the model definition.
+    """
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data", type=Path, default=Path("data/cats_dogs_resized_64"))
     parser.add_argument("--output", type=Path, default=Path("models/vit_cats_dogs.pt"))
-
-    # Image and patch settings determine the visual token sequence. For
-    # example, 64x64 images with 8x8 patches produce 64 patch tokens.
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--patch-size", type=int, default=8)
-
-    # These are the small model settings. Larger values usually increase
-    # capacity and compute, but this project values inspectability over speed
-    # or state-of-the-art accuracy.
     parser.add_argument("--embed-dim", type=int, default=64)
     parser.add_argument("--depth", type=int, default=3)
     parser.add_argument("--heads", type=int, default=4)
-
-    # Training settings control how many examples and update steps are used.
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
+    parser.add_argument(
+        "--optimizer", choices=("sgd", "adam", "adamw"), default="adamw",
+        help="parameter update rule (default: adamw)",
+    )
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="auto",
+        help="auto selects CUDA when available; cuda requires CUDA",
+    )
     return parser.parse_args()
 
 
 def set_seed(seed: int) -> None:
-    """Make the small experiment more repeatable."""
+    """Make data splitting and parameter initialization repeatable where possible.
 
-    # The dataset split and DataLoader shuffling use randomness. Fixing the
-    # Python and PyTorch generators makes demonstrations easier to reproduce.
+    Reproducibility supports comparison of the training recipes discussed in
+    VI.4 §14; it does not change the representation stages in the ViT.
+    """
     random.seed(seed)
     torch.manual_seed(seed)
 
 
+def resolve_device(choice: str) -> torch.device:
+    """Choose CPU or CUDA for the companion implementation's tensor operations."""
+    if choice == "cuda" and not torch.cuda.is_available():
+        cuda_build = torch.version.cuda or "not installed (CPU-only PyTorch)"
+        raise RuntimeError(
+            "--device cuda was requested, but PyTorch cannot access CUDA. "
+            f"torch={torch.__version__}, torch CUDA build={cuda_build}."
+        )
+    use_cuda = choice == "cuda" or (choice == "auto" and torch.cuda.is_available())
+    return torch.device("cuda" if use_cuda else "cpu")
+
+
 def make_datasets(data_root: Path, image_size: int, val_ratio: float, seed: int):
-    """Build training and validation datasets from one of two layouts.
+    """Load labeled examples for the supervised objective described in §14.
 
-    Supported layouts:
-
-    1. Explicit split, which is useful when prepare_data.py was used:
-
-           data_root/train/cat/*.jpg
-           data_root/val/cat/*.jpg
-
-    2. One folder per class, where this function makes a deterministic split:
-
-           data_root/cat/*.jpg
-           data_root/dog/*.jpg
-
-    Keeping the split logic here makes the dataset class itself easier to
-    understand: it only needs to load one labeled example at a time.
+    Explicit train/validation folders preserve the held-out evaluation boundary
+    used to diagnose model behavior (§15). The flat-folder split is a compact
+    convenience for the companion code, not a ViT-specific operation (§17).
     """
-
-    train_root = data_root / "train"
-    val_root = data_root / "val"
-
+    train_root, val_root = data_root / "train", data_root / "val"
     if train_root.is_dir():
-        # The helper normally creates this explicit layout.
         train_data = ImageFolderDataset(train_root, image_size)
-        classes = train_data.classes
-
         if val_root.is_dir():
-            # Pass the training class order to validation so label 0 means the
-            # same class in both datasets.
-            val_data = ImageFolderDataset(val_root, image_size, classes=classes)
-        else:
-            # A train folder without a val folder is still valid; split it
-            # below using the same code path as the flat layout.
-            val_data = None
+            val_data = ImageFolderDataset(val_root, image_size, classes=train_data.classes)
+            return train_data, val_data, train_data.classes
+        source_data = train_data
     else:
-        # Treat data_root itself as an ImageFolder-style dataset.
-        train_data = ImageFolderDataset(data_root, image_size)
-        classes = train_data.classes
-        val_data = None
-
-    # If the caller supplied data/train and data/val, preserve that split.
-    if val_data is not None:
-        return train_data, val_data, classes
-
+        source_data = ImageFolderDataset(data_root, image_size)
     if not 0.0 < val_ratio < 1.0:
-        raise ValueError("val-ratio must be between 0 and 1 when no val directory is supplied")
-
-    # random_split returns two dataset views that refer to the same underlying
-    # examples. The generator makes the choice reproducible.
-    val_count = max(1, int(len(train_data) * val_ratio))
-    train_count = len(train_data) - val_count
+        raise ValueError("--val-ratio must be between 0 and 1 when no val/ folder exists")
+    val_count = max(1, int(len(source_data) * val_ratio))
+    train_count = len(source_data) - val_count
     if train_count < 1:
         raise ValueError("The dataset needs at least two images for a train/validation split")
     generator = torch.Generator().manual_seed(seed)
-    train_data, val_data = random_split(train_data, [train_count, val_count], generator=generator)
-    return train_data, val_data, classes
+    train_data, val_data = random_split(source_data, [train_count, val_count], generator=generator)
+    return train_data, val_data, source_data.classes
 
 
-def run_epoch(
-    model: VisionTransformer,
-    loader: DataLoader,
-    loss_function: nn.Module,
-    device: torch.device,
-    optimizer: torch.optim.Optimizer | None,
-) -> tuple[float, float]:
-    """Run one training or evaluation pass and return loss and accuracy.
+def run_epoch(model, loader, criterion, device, classes, optimizer=None) -> dict:
+    """Run a forward pass, and optionally a loss-gradient-update training step.
 
-    Passing an optimizer means training mode. Passing ``None`` means
-    validation mode. Keeping one function for both paths makes the difference
-    visible: training computes gradients and updates weights; validation only
-    measures the current model.
+    The model's visual representation path is in VI.4 §§2-8. Cross-entropy,
+    backpropagation, and the selected optimizer are training choices (§14).
+    Passing no optimizer makes this a read-only evaluation pass.
     """
-
-    # ``optimizer is not None`` is our simple mode flag.
     training = optimizer is not None
     model.train(training)
-
-    # We accumulate totals over all examples, rather than averaging batch
-    # averages. That remains correct when the final batch is smaller.
-    total_loss = 0.0
-    correct = 0
-    total = 0
-
-    # Gradient tracking is the expensive part that evaluation does not need.
-    # ``torch.no_grad`` also prevents validation tensors from being retained
-    # for backward computation.
+    metrics = MetricAccumulator(classes, device=device)
     context = torch.enable_grad() if training else torch.no_grad()
     with context:
         for images, labels in loader:
-            # Move both the input pixels and target integers to CPU or GPU.
             images, labels = images.to(device), labels.to(device)
-
-            # The ViT returns logits with shape (batch_size, num_classes).
             logits = model(images)
-
-            # CrossEntropyLoss combines a class-score normalization step with
-            # negative log-likelihood. It expects raw logits, so train.py does
-            # not apply softmax before calling it.
-            loss = loss_function(logits, labels)
-
+            batch_loss_sum = criterion(logits, labels)
             if training:
-                # One standard gradient-descent update:
-                #   1. remove gradients left by the previous batch;
-                #   2. compute d(loss)/d(parameter) by backpropagation;
-                #   3. let Adam change each learned parameter.
                 optimizer.zero_grad()
-                loss.backward()
+                (batch_loss_sum / labels.size(0)).backward()
                 optimizer.step()
+            metrics.update(logits.detach(), labels, batch_loss_sum.detach().item())
+    return metrics.summary()
 
-            # Convert the batch mean loss back to a sum so examples contribute
-            # equally even if batches have different sizes.
-            total_loss += loss.item() * labels.size(0)
 
-            # The largest logit is the predicted class index. This is only an
-            # evaluation statistic; gradients use the full loss above.
-            correct += (logits.argmax(dim=1) == labels).sum().item()
-            total += labels.size(0)
+def log_metrics(split: str, metrics: dict, classes: list[str]) -> None:
+    """Print classification diagnostics for the selected data split.
 
-    return total_loss / total, correct / total
+    Accuracy, per-class recall, and the confusion matrix help localize the
+    failures in VI.4 §15; these aggregate scores do not explain model causes.
+    """
+    log(
+        f"{split}_loss={metrics['loss']:.4f} {split}_accuracy={metrics['accuracy']:.1%} "
+        f"{split}_macro_precision={metrics['macro_precision']:.1%} "
+        f"{split}_macro_recall={metrics['macro_recall']:.1%} "
+        f"{split}_macro_f1={metrics['macro_f1']:.1%}"
+    )
+    for name, values in metrics["per_class"].items():
+        log(
+            f"{split}_class={name} support={values['support']} "
+            f"precision={values['precision']:.1%} recall={values['recall']:.1%} "
+            f"f1={values['f1']:.1%}"
+        )
+    matrix = metrics["confusion_matrix"]
+    log(
+        f"{split}_confusion_matrix rows=actual columns=predicted "
+        f"classes={classes} values={matrix['values']}"
+    )
 
 
 def main() -> None:
-    """Parse settings, train the ViT, and save its best validation checkpoint."""
+    """Connect data, the ViT, a supervised objective, and checkpoint selection.
 
+    This is the runnable companion pipeline (§17), spanning the stages from
+    image-grid preprocessing through the §8 classification readout. The best
+    validation checkpoint is selected by a task metric, not by architecture.
+    """
     args = parse_args()
-    set_seed(args.seed)
-
-    # Patch extraction assumes an exact grid. This check catches a common
-    # configuration mistake before the first batch reaches the model.
+    if args.epochs <= 0 or args.batch_size <= 0 or args.learning_rate <= 0:
+        raise ValueError("epochs, batch-size, and learning-rate must be positive")
     if args.image_size % args.patch_size != 0:
         raise ValueError("image-size must be divisible by patch-size")
+    set_seed(args.seed)
+    device = resolve_device(args.device)
 
     train_data, val_data, classes = make_datasets(
-        args.data,
-        args.image_size,
-        args.val_ratio,
-        args.seed,
+        args.data, args.image_size, args.val_ratio, args.seed
     )
+    if not len(train_data) or not len(val_data):
+        raise ValueError("Training and validation splits must both contain images")
+    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False, num_workers=0)
 
-    # DataLoader turns individual (image, label) examples into batches. The
-    # model receives images shaped (B, 3, image_size, image_size).
-    train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_data, batch_size=args.batch_size, shuffle=False)
-
-    # Prefer a CUDA GPU when PyTorch can see one; CPU is enough for the tiny
-    # defaults and keeps this repository easy to run.
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = VisionTransformer(
         image_size=args.image_size,
         patch_size=args.patch_size,
@@ -234,62 +189,49 @@ def main() -> None:
         depth=args.depth,
         num_heads=args.heads,
     ).to(device)
+    optimizer_types = {"sgd": torch.optim.SGD, "adam": torch.optim.Adam, "adamw": torch.optim.AdamW}
+    optimizer_type = optimizer_types[args.optimizer]
+    optimizer = optimizer_type(model.parameters(), lr=args.learning_rate)
+    criterion = nn.CrossEntropyLoss(reduction="sum")
 
-    # The task is supervised classification: each image has one integer class
-    # label. Adam is chosen as a familiar, simple optimizer for this example.
-    loss_function = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
-
-    print(f"classes: {classes}")
-    print(f"images: {len(train_data)} train, {len(val_data)} validation")
-    print(f"device: {device}")
-    best_val_accuracy = -1.0
+    log(
+        f"optimizer={optimizer_type.__name__} learning_rate={args.learning_rate:g} "
+        f"epochs={args.epochs} batch_size={args.batch_size} image_size={args.image_size}"
+    )
+    log(f"classes={classes} train={len(train_data)} val={len(val_data)} data={args.data}")
+    if device.type == "cuda":
+        log(f"device={device} gpu={torch.cuda.get_device_name(device)}")
+    else:
+        log(f"device={device}")
+    best_accuracy = -1.0
 
     for epoch in range(1, args.epochs + 1):
-        # Training changes parameters.
-        train_loss, train_accuracy = run_epoch(
-            model,
-            train_loader,
-            loss_function,
-            device,
-            optimizer,
-        )
+        log(f"epoch {epoch:02d}/{args.epochs} starting")
+        train_metrics = run_epoch(model, train_loader, criterion, device, classes, optimizer)
+        val_metrics = run_epoch(model, val_loader, criterion, device, classes)
+        log(f"epoch {epoch:02d}/{args.epochs} complete")
+        log_metrics("train", train_metrics, classes)
+        log_metrics("val", val_metrics, classes)
 
-        # Validation measures generalization on examples not used for the
-        # current weight update. Passing None disables optimizer operations.
-        val_loss, val_accuracy = run_epoch(
-            model,
-            val_loader,
-            loss_function,
-            device,
-            None,
-        )
-
-        print(
-            f"epoch {epoch:02d}/{args.epochs} | "
-            f"train loss {train_loss:.4f}, acc {train_accuracy:.2%} | "
-            f"val loss {val_loss:.4f}, acc {val_accuracy:.2%}"
-        )
-
-        # Save the best validation result rather than only the final epoch.
-        # The checkpoint includes class names and model configuration because
-        # inference needs them to interpret logits and rebuild the same ViT.
-        if val_accuracy >= best_val_accuracy:
-            best_val_accuracy = val_accuracy
+        if val_metrics["accuracy"] >= best_accuracy:
+            best_accuracy = val_metrics["accuracy"]
             args.output.parent.mkdir(parents=True, exist_ok=True)
             torch.save(
                 {
                     "classes": classes,
                     "config": model.config,
                     "model": model.state_dict(),
+                    "optimizer": args.optimizer,
+                    "learning_rate": args.learning_rate,
+                    "seed": args.seed,
                 },
                 args.output,
             )
 
-    print(f"saved best checkpoint to {args.output}")
+    log(f"training complete; best validation accuracy={best_accuracy:.1%}")
+    log_model_info(model, classes, args.image_size, device, str(args.output))
+    log(f"saved best checkpoint to {args.output}")
 
 
 if __name__ == "__main__":
-    # This guard lets the file be run directly while also allowing its
-    # functions to be imported by another script or notebook.
     main()

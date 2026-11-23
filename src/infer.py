@@ -8,6 +8,10 @@ parameters to answer one new question:
 This file intentionally does not contain a second model definition. It reads
 the architecture configuration saved by train.py, rebuilds the same model, and
 loads the learned weights.
+
+The pipeline mirrors VI.4's distinction between contextualized visual states
+and task readout (§8): the ViT returns logits, then this file converts them to
+class probabilities for display.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ except ImportError:
 
 
 def parse_args() -> argparse.Namespace:
-    """Define the checkpoint and one image to classify."""
+    """Define the saved model and one image supplied for its readout."""
 
     parser = argparse.ArgumentParser(description="Classify one image with a trained ViT.")
     parser.add_argument("--checkpoint", type=Path, default=Path("models/vit_cats_dogs.pt"))
@@ -37,7 +41,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    """Load a trained model and print its class probabilities."""
+    """Restore the trained patch grid, run one image, and display its readout."""
 
     args = parse_args()
 
@@ -53,17 +57,17 @@ def main() -> None:
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
-    # Use the exact image size saved with the model. Inference must perform the
-    # same resize operation as training or the patch grid will not match the
-    # learned positional embedding table.
+    # Use the exact model input size saved at training. This resize occurs
+    # before patchification and may discard fine evidence (VI.4 §§11, 13, 15).
+    # The patch grid and learned position table must then match the checkpoint.
     image_size = checkpoint["config"]["image_size"]
     image = image_to_tensor(args.image, image_size).unsqueeze(0).to(device)
 
     # A single image has shape (1, 3, H, W). The batch dimension is still
     # present because the ViT is written to process batches uniformly.
     #
-    # The model returns logits, not probabilities. softmax converts the logits
-    # to positive values summing to one so they are easier to read as scores.
+    # The model's class-token readout returns logits (§8). Softmax converts
+    # them to positive values summing to one for display; it is not a ViT layer.
     with torch.no_grad():
         probabilities = model(image).softmax(dim=1)[0]
 

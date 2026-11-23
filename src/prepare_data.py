@@ -14,6 +14,10 @@ The output class names are lower-cased so the example produces the simple
 ``cat`` and ``dog`` labels used in the README. The same approach works for any
 raw dataset whose immediate subdirectories represent classes.
 
+This is dataset setup for the VI.4 companion code (§17), not a ViT operation.
+The train/validation boundary supports held-out diagnostics (§15); image resize
+and patchification happen later in separate steps.
+
 Example:
 
     python -m src.prepare_data --source raw/PetImages --output data/cats_dogs --per-class 100
@@ -31,7 +35,7 @@ from PIL import Image
 
 
 def parse_args() -> argparse.Namespace:
-    """Define how many readable files to select for each class."""
+    """Define the source subset and held-out validation split."""
 
     parser = argparse.ArgumentParser(description="Make a small train/val image-folder dataset.")
     parser.add_argument("--source", type=Path, required=True)
@@ -48,6 +52,9 @@ def valid_images(directory: Path) -> list[Path]:
     Large public archives sometimes contain a small number of damaged or
     incomplete files. Filtering them before copying prevents a training run
     from failing later when a batch happens to request one of those files.
+
+    This validates file integrity only; it does not judge whether the image
+    resolution preserves the evidence discussed in VI.4 §§11 and 15.
     """
 
     paths = []
@@ -70,7 +77,7 @@ def valid_images(directory: Path) -> list[Path]:
 
 
 def main() -> None:
-    """Select, split, and copy a small dataset."""
+    """Create labeled train/validation folders for the companion pipeline."""
 
     args = parse_args()
     if args.val_count >= args.per_class:

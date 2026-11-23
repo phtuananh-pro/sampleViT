@@ -21,6 +21,11 @@ the tensor notation ``(B, N, D)`` frequently used in the chapter:
 For the defaults in this file, a ``64 x 64`` RGB image becomes a sequence of
 ``(64 / 8) * (64 / 8) = 64`` patch tokens. Adding one learned class token
 makes the Transformer sequence length ``65``.
+
+Chapter VI.4 map: :class:`PatchEmbedding` covers §§2-4; learned spatial
+positions are added in :class:`VisionTransformer` (§5); global token
+interaction is in :class:`TransformerBlock` (§6); the class-token readout is
+§8. The resulting patch count and full-attention cost follow §§9-11.
 """
 
 from __future__ import annotations
@@ -46,9 +51,20 @@ class PatchEmbedding(nn.Module):
     dimension is the embedding dimension ``D``. This is the equivalence
     mentioned in the chapter: the input projection can be written as a
     convolution, even though the later Transformer computation is not a CNN.
+
+    Chapter VI.4 §§2-4 distinguish a patch, its flattened measurements, and
+    its learned embedding. This implementation uses one strided convolution
+    to perform patch extraction and the shared learned projection together;
+    it does not keep an intermediate raw flattened-patch tensor.
     """
 
     def __init__(self, image_size: int, patch_size: int, channels: int, embed_dim: int) -> None:
+        """Set the fixed patch grid and shared patch-to-token projection.
+
+        The number of grid positions is the ``N_p`` from VI.4 §3. A fixed
+        square grid keeps this teaching implementation small; variable grids
+        require a position strategy beyond the learned table used below (§13).
+        """
         super().__init__()
 
         # The simple implementation assumes a regular grid with no partial
@@ -75,7 +91,12 @@ class PatchEmbedding(nn.Module):
         )
 
     def forward(self, images: torch.Tensor) -> torch.Tensor:
-        """Convert a batch of image grids into a batch of patch sequences."""
+        """Project each non-overlapping image region into one patch embedding.
+
+        This is the image-grid-to-visual-sequence transition from VI.4 §§2-4.
+        The output is ``(B, N_p, D)``: patch embeddings, not yet
+        position-aware or contextualized patch states.
+        """
 
         # Before the projection, images are spatial grids:
         #     images.shape == (B, C, H, W)
@@ -111,6 +132,10 @@ class TransformerBlock(nn.Module):
     pre-norm block. The residual paths help information and gradients travel
     through several blocks without forcing every layer to relearn the full
     representation.
+
+    This is the Part IV Transformer machinery reused by VI.4 §6. Full
+    self-attention gives every visual state a direct route to every other
+    state; §10 explains why interaction cost grows with sequence length.
     """
 
     def __init__(
@@ -120,6 +145,7 @@ class TransformerBlock(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
     ) -> None:
+        """Create one self-attention plus feed-forward Transformer block."""
         super().__init__()
 
         # LayerNorm operates on the final dimension D of each token and does
@@ -157,7 +183,12 @@ class TransformerBlock(nn.Module):
         )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Contextualize tokens while preserving the sequence shape."""
+        """Let visual states exchange information while preserving their count.
+
+        In VI.4 §6, this is where a patch embedding becomes a contextualized
+        patch state. Attention mixes information across positions; the MLP
+        transforms features within each position.
+        """
 
         # tokens.shape is (B, N, D). Normalize before attention, but keep
         # the original tokens for the residual addition.
@@ -199,6 +230,11 @@ class VisionTransformer(nn.Module):
     grid. Without position information, a Transformer would see a set of
     patch contents but would have much less information about their 2-D
     arrangement.
+
+    Chapter VI.4 §5 is implemented by the learned position table; §8 is
+    implemented by the prepended class token and final readout. This plain ViT
+    uses one fixed input grid, leaving the sequence-length and variable-grid
+    trade-offs from §§9-13 visible rather than hiding them in a larger system.
     """
 
     def __init__(
@@ -213,6 +249,11 @@ class VisionTransformer(nn.Module):
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
     ) -> None:
+        """Assemble patch projection, spatial positions, encoder, and readout.
+
+        The stored configuration lets inference rebuild exactly the same
+        patch grid and positional-table shape as training.
+        """
         super().__init__()
 
         # Save the architectural choices inside the model so a checkpoint can
@@ -276,6 +317,10 @@ class VisionTransformer(nn.Module):
         receive reasonable defaults from PyTorch. We explicitly initialize the
         parameters that are unique to this model so the important ViT objects
         are easy to identify.
+
+        The class-token and position-table parameters correspond to VI.4 §§5
+        and 8. Initialization itself is a training detail rather than a new
+        visual representation stage.
         """
 
         # Small random values break symmetry: every position and the class
@@ -310,6 +355,10 @@ class VisionTransformer(nn.Module):
             final class-token image representation;
         ``(B, num_classes)``
             task-specific classification logits.
+
+        The VI.4 path is explicit here: patch embeddings (§§2-4), position
+        information (§5), contextualized states (§6), and a compressed
+        image-level class-token readout (§8).
         """
 
         # Step 1: make one projected vector per image patch.
